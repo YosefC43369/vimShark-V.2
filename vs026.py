@@ -2550,6 +2550,11 @@ class VimSharkApp:
 
         self.telemetry = TrafficTelemetry()
         self.dissector = FastDissector()
+        self.hostname_cache       = HostnameCache()
+        self.stream_reassembler   = TCPStreamReassembler()
+        self.proto_stats          = ProtocolStats()
+        self.baseline_detector    = BaselineDetector(self.queue_alert)
+        self._stream_dir_filter   = "both"   # used by follow_stream
         self.pkt_queue: "queue.Queue[int]" = queue.Queue()
         self.alert_queue: "queue.Queue[str]" = queue.Queue()
         self.auditor = ThreatAuditor(self.queue_alert)
@@ -2942,6 +2947,49 @@ class VimSharkApp:
         self.auditor.audit_packet(data)
         if summary.get('proto') == 'TLS':
             self.auditor.audit_tls(summary)
+        if summary.get('proto') == 'DNS':
+            for layer in summary.get('layers', []):
+                if layer.get('name') != 'DNS':
+                    continue
+                for answer in layer.get('answers', []):
+                    rtype = answer.get('type', '')
+                    name  = answer.get('name', '')
+                    rdata = answer.get('rdata', '')
+                    if rtype in ('A', 'AAAA') and name and rdata:
+                        self.hostname_cache.learn(rdata, name)
+
+        # --- TCP stream reassembly feed ---
+        try:
+            eth = dpkt.ethernet.Ethernet(data)
+            ip_pkt = eth.data
+            if isinstance(ip_pkt, (dpkt.ip.IP, dpkt.ip6.IP6)):
+                transport = getattr(ip_pkt, 'data', None)
+                if isinstance(transport, dpkt.tcp.TCP):
+                    is_v6   = isinstance(ip_pkt, dpkt.ip6.IP6)
+                    to_str  = ip6_to_str if is_v6 else ip_to_str
+                    src_ip  = to_str(ip_pkt.src)
+                    dst_ip  = to_str(ip_pkt.dst)
+                    payload = getattr(transport, 'data', b'')
+                    if isinstance(payload, bytes) and payload:
+                        self.stream_reassembler.feed(
+                            src_ip, transport.sport,
+                            dst_ip, transport.dport,
+                            transport.seq, payload, ts
+                        )
+        except Exception:
+            pass
+
+        # --- Protocol statistics ---
+        self.proto_stats.record(summary)
+
+        # --- Extended threat audits ---
+        self.auditor.audit_dns_tunneling(summary)
+        self.auditor.audit_cleartext_credentials(summary)
+        self.auditor.audit_llmnr_nbns(summary)
+        self.auditor.audit_brute_force(summary, ts)
+
+        # --- TCP retransmit / window metrics ---
+        self.flow_tracker.update_tcp_metrics(summary, ts)
 
         # IPv4 fragmentation reassembly
         try:
@@ -3024,13 +3072,17 @@ class VimSharkApp:
             self.alrt_walker.set_focus(len(self.alrt_walker) - 1)
 
         pr, br = self.telemetry.tick()
+        # Feed current rates into the baseline detector and bandwidth auditor
+        self.baseline_detector.update(pr, br)
+        self.auditor.audit_bandwidth_threshold(br,
+            getattr(self, '_bw_alert_mbps', 100.0))
         self.tel_pkt.set_text(f"Throughput: {self.telemetry.format_unit(pr)} p/s  {self.telemetry.get_sparkline('p')}")
         self.tel_byte.set_text(f"Bandwidth:  {self.telemetry.format_unit(br, True)}/s  {self.telemetry.get_sparkline('b')}")
         self.tel_total.set_text(
             f"Total: {self.telemetry.format_unit(self.telemetry.total_packets)} pkts / "
             f"{self.telemetry.format_unit(self.telemetry.total_bytes, True)}"
         )
-
+        
         status = "PAUSED" if self.paused else "LIVE"
         mode = "READ" if self.read_pcap else "CAPTURE"
         src = self.read_pcap or self.interface
@@ -3095,6 +3147,16 @@ class VimSharkApp:
             self.auditor.incremental_tracking.clear()
             self.auditor.host_scan_tracking.clear()
             self.auditor.arp_scan_tracking.clear()
+            self.hostname_cache.__init__()
+            self.stream_reassembler.clear()
+            self.proto_stats.clear()
+            self.baseline_detector.reset()
+            if hasattr(self.auditor, '_brute_tracking'):
+                self.auditor._brute_tracking.clear()
+            if hasattr(self.auditor, '_brute_alerted'):
+                self.auditor._brute_alerted.clear()
+            if hasattr(self.flow_tracker, '_tcp_metrics'):
+                self.flow_tracker._tcp_metrics.clear()
         elif key == '/':
             # Focus filter
             self.root.focus_position = 'body'
@@ -3113,6 +3175,30 @@ class VimSharkApp:
             self.show_flows_modal()
         elif key in ('a', 'A'):
             self.show_auditor_modal()
+        elif key in ('n', 'N'):
+            self.show_proto_stats_modal()
+        elif key in ('d', 'D'):
+            self.show_hostname_cache_modal()
+        elif key in ('r', 'R'):
+            self.show_streams_modal()
+        elif key in ('b', 'B'):
+            # Toggle bandwidth alert threshold
+            thresholds = [10.0, 50.0, 100.0, 500.0, 0.0]  # 0 = off
+            cur = getattr(self, '_bw_alert_mbps', 100.0)
+            try:
+                idx = thresholds.index(cur)
+            except ValueError:
+                idx = 2
+            self._bw_alert_mbps = thresholds[(idx + 1) % len(thresholds)]
+            if self._bw_alert_mbps == 0.0:
+                self.queue_alert("[BW] Bandwidth threshold alerts disabled")
+            else:
+                self.queue_alert(
+                    f"[BW] Bandwidth threshold set to {self._bw_alert_mbps:.0f} Mbps"
+                )
+        elif key in ('x', 'X'):
+            self.baseline_detector.reset()
+            self.queue_alert("[BASELINE] Traffic baseline reset — re-learning...")
 
     def _safe_listbox_keypress(self, direction: str) -> None:
         """Safely send up/down keys to the ListBox even if size() is unavailable."""
@@ -3163,9 +3249,11 @@ class VimSharkApp:
         return ', '.join(parts) or 'none'
 
     def _update_footer(self) -> None:
-        """Re‑build the footer text so the toggle status is always visible."""
-        base = " [Q]uit [T]heme [P]ause [F]ollow [S]earch Hex [E]xport [V]alidate " \
-               "[C]lear [L]Flows [A]uditor [/]Filter"
+        base = (
+            " [Q]uit [T]heme [P]ause [F]ollow [S]Hex [E]xport [V]alidator "
+            "[C]lear [L]Flows [A]uditor [/]Filter "
+            "[N]Stats [D]DNS [R]Streams [B]BW-thresh [X]Baseline"
+        )
         status = f"  Auditors: {self._auditor_status()}"
         self.footer.set_text(base + status)
 
@@ -3346,7 +3434,144 @@ class VimSharkApp:
             parent, 'center', ('relative', 80), 'middle', ('relative', 80)
         )
         
-    def show
+    def show_proto_stats_modal(self) -> None:
+        """Display protocol distribution, top talkers, and port usage."""
+        rows: List[urwid.Widget] = []
+
+        # Header
+        rows.append(urwid.AttrMap(
+            urwid.Text(" Protocol Distribution  [bytes %]", align='center'), 'header'
+        ))
+        rows.append(urwid.Divider())
+
+        dist = self.proto_stats.proto_distribution()
+        for proto, pkts, byt, pct in dist[:15]:
+            bar_len = int(pct / 2)   # max 50 chars
+            bar = '█' * bar_len + '░' * (50 - bar_len)
+            rows.append(urwid.Text(
+                f" {proto:<8} {bar}  {pct:5.1f}%  "
+                f"{TrafficTelemetry.format_unit(byt, True):>8}  "
+                f"{pkts} pkts"
+            ))
+
+        rows.append(urwid.Divider())
+        rows.append(urwid.AttrMap(urwid.Text(" Top Source Talkers"), 'header'))
+        for ip, byt in self.proto_stats.top_talkers_src(8):
+            annotated = self.hostname_cache.annotate(ip)
+            rows.append(urwid.Text(
+                f"  {annotated:<36} "
+                f"{TrafficTelemetry.format_unit(byt, True):>10}"
+            ))
+
+        rows.append(urwid.Divider())
+        rows.append(urwid.AttrMap(urwid.Text(" Top Destination Ports"), 'header'))
+        _WELL_KNOWN = {
+            20:'FTP-data', 21:'FTP', 22:'SSH', 23:'Telnet', 25:'SMTP',
+            53:'DNS', 80:'HTTP', 110:'POP3', 123:'NTP', 143:'IMAP',
+            443:'HTTPS', 445:'SMB', 587:'SMTP/S', 3306:'MySQL',
+            3389:'RDP', 5355:'LLMNR', 8080:'HTTP-alt', 8443:'HTTPS-alt',
+        }
+        for port, cnt in self.proto_stats.top_ports(12):
+            svc = _WELL_KNOWN.get(port, '')
+            rows.append(urwid.Text(
+                f"  :{port:<6}  {cnt:>8} pkts  {svc}"
+            ))
+
+        rows.append(urwid.Divider())
+        # Baseline info
+        bl = self.baseline_detector.baseline_summary()
+        learn_str = "LEARNING" if bl['learning'] else "MONITORING"
+        rows.append(urwid.AttrMap(urwid.Text(f" Baseline [{learn_str}]"), 'header'))
+        rows.append(urwid.Text(
+            f"  EMA pps: {bl['ema_pps']:.1f}   "
+            f"EMA bps: {TrafficTelemetry.format_unit(bl['ema_bps'], True)}/s"
+        ))
+        rows.append(urwid.Text(
+            f"  Streams active: {self.stream_reassembler.active_stream_count()}   "
+            f"Hostnames cached: {len(self.hostname_cache)}"
+        ))
+
+        close_btn = urwid.Button("Close")
+        parent = self.root.body
+        urwid.connect_signal(close_btn, 'click',
+                             lambda _b: setattr(self.root, 'body', parent))
+        rows.append(urwid.Divider())
+        rows.append(close_btn)
+
+        self.root.body = urwid.Overlay(
+            urwid.LineBox(
+                urwid.ListBox(urwid.SimpleListWalker(rows)),
+                title="Protocol Statistics"
+            ),
+            parent, 'center', ('relative', 85), 'middle', ('relative', 85)
+        )
+
+    def show_streams_modal(self) -> None:
+        """Display TCP stream reassembly stats — top streams by size."""
+        rows: List[urwid.Widget] = [
+            urwid.AttrMap(urwid.Text(" TCP Stream Reassembly — Top Streams"), 'header'),
+            urwid.Divider(),
+        ]
+        streams = self.stream_reassembler.top_streams_by_size(20)
+        if not streams:
+            rows.append(urwid.Text("  (no reassembled streams yet)"))
+        for s in streams:
+            rows.append(urwid.Text(
+                f"  {s['src']:<24} → {s['dst']:<24} | "
+                f"{TrafficTelemetry.format_unit(s['bytes'], True):>8} | "
+                f"{s['segments']} segs | {s['gaps']} gaps"
+            ))
+
+        rows.append(urwid.Divider())
+        rows.append(urwid.Text(
+            f"  Active streams: {self.stream_reassembler.active_stream_count()}"
+        ))
+        close_btn = urwid.Button("Close")
+        parent = self.root.body
+        urwid.connect_signal(close_btn, 'click',
+                             lambda _b: setattr(self.root, 'body', parent))
+        rows.append(urwid.Divider())
+        rows.append(close_btn)
+
+        self.root.body = urwid.Overlay(
+            urwid.LineBox(
+                urwid.ListBox(urwid.SimpleListWalker(rows)),
+                title="TCP Streams"
+            ),
+            parent, 'center', ('relative', 80), 'middle', ('relative', 75)
+        )
+
+    def show_hostname_cache_modal(self) -> None:
+        """Display passively resolved DNS hostnames."""
+        rows: List[urwid.Widget] = [
+            urwid.AttrMap(
+                urwid.Text(" Passive DNS Cache — IP → Hostname"), 'header'
+            ),
+            urwid.Divider(),
+        ]
+        dump = self.hostname_cache.dump()
+        if not dump:
+            rows.append(urwid.Text("  (no DNS resolutions observed yet)"))
+        else:
+            for ip, hostname in sorted(dump.items()):
+                rows.append(urwid.Text(f"  {ip:<20} → {hostname}"))
+
+        rows.append(urwid.Divider())
+        rows.append(urwid.Text(f"  Total entries: {len(dump)}"))
+        close_btn = urwid.Button("Close")
+        parent = self.root.body
+        urwid.connect_signal(close_btn, 'click',
+                             lambda _b: setattr(self.root, 'body', parent))
+        rows.append(urwid.Divider())
+        rows.append(close_btn)
+
+        self.root.body = urwid.Overlay(
+            urwid.LineBox(
+                urwid.ListBox(urwid.SimpleListWalker(rows)),
+                title="DNS Cache"
+            ),
+            parent, 'center', ('relative', 70), 'middle', ('relative', 70)
+        )
 
     def export_filtered_packets(self, filename: str) -> None:
         try:
@@ -3717,6 +3942,22 @@ def main() -> None:
                         help="Max rows kept in the visible traffic list")
     parser.add_argument("--theme", default="btop_classic",
                         choices=list(THEMES.keys()), help="Initial color theme")
+    parser.add_argument(
+        "--bw-threshold", type=float, default=100.0,
+        help="Bandwidth alert threshold in Mbps (0 = disabled, default 100)"
+    )
+    parser.add_argument(
+        "--dns-cache-size", type=int, default=8192,
+        help="Passive DNS cache max entries (default 8192)"
+    )
+    parser.add_argument(
+        "--stream-max", type=int, default=512,
+        help="Max concurrent TCP streams to reassemble (default 512)"
+    )
+    parser.add_argument(
+        "--baseline-learn", type=int, default=120,
+        help="Seconds to spend learning traffic baseline before alerting (default 120)"
+    )
     parser.add_argument("--log-level", default="WARNING",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Log verbosity (written to vimshark.log)")
@@ -3749,6 +3990,10 @@ def main() -> None:
         theme=args.theme,
         scan_threshold=args.scan_threshold,
     )
+    app._bw_alert_mbps = args.bw_threshold
+    app.hostname_cache._MAX = args.dns_cache_size
+    app.stream_reassembler._MAX_STREAMS = args.stream_max
+    app.baseline_detector._LEARN_SECONDS = args.baseline_learn
     app.run()
 
 
