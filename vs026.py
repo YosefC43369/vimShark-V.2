@@ -23,6 +23,16 @@ except ImportError:
     default_backend = None
 import urwid
 import dpkt
+import json
+import csv
+import zlib
+import base64
+import string
+import unicodedata
+from functools import lru_cache
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Generator, Iterator
 
 # Optional dpkt submodules - not all builds ship every protocol module
 try: import dpkt.ntp  # noqa: F401
@@ -231,6 +241,54 @@ THEMES:Dict[str, List[Tuple]] = {
         ('ja3', 'black', 'yellow', 'standout', '#282a36', '#f1fa8c'),
         ('dim', 'dark gray', 'default', 'default', '#6272a4', '#282a36'),
     ],
+    "midnight_blue": [
+        ('bg',          'dark blue',      'black'),
+        ('header',      'white',          'dark blue'),
+        ('footer',      'white',          'dark blue'),
+        ('border',      'light blue',     'black'),
+        ('selected',    'black',          'light cyan'),
+        ('pkt_tcp',     'light cyan',     'black'),
+        ('pkt_udp',     'dark cyan',      'black'),
+        ('pkt_arp',     'yellow',         'black'),
+        ('pkt_dns',     'light green',    'black'),
+        ('pkt_icmp',    'brown',          'black'),
+        ('pkt_icmp6',   'light magenta',  'black'),
+        ('pkt_http',    'light blue',     'black'),
+        ('pkt_tls',     'light green',    'black'),
+        ('pkt_ntp',     'dark green',     'black'),
+        ('pkt_other',   'dark gray',      'black'),
+        ('spark_bar',   'light blue',     'black'),
+        ('text_focus',  'white',          'black'),
+        ('warn',        'light red',      'black'),
+        ('good',        'light green',    'black'),
+        ('ja3',         'light magenta',  'black'),
+        ('dim',         'dark gray',      'black'),
+        ('default',     'light gray',     'black'),
+    ],
+    "solarized": [
+        ('bg',          'dark gray',      'black'),
+        ('header',      'dark blue',      'dark gray'),
+        ('footer',      'dark blue',      'dark gray'),
+        ('border',      'dark cyan',      'black'),
+        ('selected',    'black',          'dark yellow'),
+        ('pkt_tcp',     'dark cyan',      'black'),
+        ('pkt_udp',     'dark green',     'black'),
+        ('pkt_arp',     'dark yellow',    'black'),
+        ('pkt_dns',     'dark blue',      'black'),
+        ('pkt_icmp',    'dark magenta',   'black'),
+        ('pkt_icmp6',   'dark red',       'black'),
+        ('pkt_http',    'dark cyan',      'black'),
+        ('pkt_tls',     'dark green',     'black'),
+        ('pkt_ntp',     'dark blue',      'black'),
+        ('pkt_other',   'dark gray',      'black'),
+        ('spark_bar',   'dark cyan',      'black'),
+        ('text_focus',  'light gray',     'black'),
+        ('warn',        'dark red',       'black'),
+        ('good',        'dark green',     'black'),
+        ('ja3',         'dark magenta',   'black'),
+        ('dim',         'dark gray',      'black'),
+        ('default',     'light gray',     'black'),
+    ],
     "cyberpunk": [
         ('bg', 'default', 'default', 'default', '#00ff00', '#000b1e'),
         ('header', 'white', 'dark magenta', 'bold', '#ffffff', '#ff0055'),
@@ -391,6 +449,378 @@ class TrafficTelemetry:
         h = list(self.packet_history if metric == "p" else self.byte_history)
         m_max = max(h) if h and max(h) > 0 else 1
         return "".join(self.blocks[min(7, int(v * 7 / m_max))] for v in h)
+        
+        
+class HostnameCache:
+    """Passive DNS resolver: maps IP->hostname from observed DNS responses.
+    Thread-safe. Never makes live queries — purely observational."""
+    
+    _MAX = 8192
+    
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._fwd: Dict[str, str] = {}   # ip -> hostname
+        self._rev: Dict[str, str] = {}   # host -> ip
+        
+    def learn(self, ip: str, hostname: str) -> None:
+        if not ip or not hostname:
+            return
+        with self._lock:
+            if len(self._fwd) >= self._MAX:
+                # Evict 10 % oldest (insertion-order dict >= 3.7)
+                evict = list(self._fwd.keys())[:self._MAX // 10]
+                for k in evict:
+                    h = self._fwd.pop(k, None)
+                    if h:
+                        self._rev.pop(h, None)
+            self._fwd[ip] = hostname
+            self._rev[hostname] = ip
+            
+    def resolve(self, ip: str) -> Optional[str]:
+        with self._lock:
+            return self._fwd.get(ip)
+
+    def reverse(self, hostname: str) -> Optional[str]:
+        with self._lock:
+            return self._rev.get(hostname)
+
+    def annotate(self, ip: str) -> str:
+        """Return 'ip (hostname)' if known, else just 'ip'."""
+        h = self.resolve(ip)
+        return f"{ip} ({h})" if h else ip
+
+    def dump(self) -> Dict[str, str]:
+        with self._lock:
+            return dict(self._fwd)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._fwd)
+            
+            
+@dataclass
+class _StreamBuffer:
+    data:      bytearray = field(default_factory=bytearray)
+    seq_next:  int       = 0          # expected next seq number
+    gaps:      int       = 0          # out-of-order segments dropped
+    segments:  int       = 0
+    first_ts:  float     = 0.0
+    last_ts:   float     = 0.0
+    
+    
+class TCPStreamReassembler:
+    """Maintains per-flow ordered byte streams for content reconstruction.
+    Keyed by (src_ip, src_port, dst_ip, dst_port) 4-tuple — directional.
+    Bidirectional follow uses both directions concatenated by timestamp."""
+
+    _MAX_STREAMS   = 512
+    _MAX_STREAM_SZ = 2 * 1024 * 1024   # 2 MiB per direction
+
+    def __init__(self) -> None:
+        self._lock    = threading.RLock()
+        self._streams: Dict[Tuple, _StreamBuffer] = {}
+        self._order:   List[Tuple]                = []   # LRU eviction
+
+    def _key(self, src_ip: str, sport: int, dst_ip: str, dport: int) -> Tuple:
+        return (src_ip, sport, dst_ip, dport)
+
+    def feed(self, src_ip: str, sport: int, dst_ip: str, dport: int,
+             seq: int, payload: bytes, ts: float) -> None:
+        if not payload:
+            return
+        key = self._key(src_ip, sport, dst_ip, dport)
+        with self._lock:
+            if key not in self._streams:
+                if len(self._streams) >= self._MAX_STREAMS:
+                    oldest = self._order.pop(0)
+                    self._streams.pop(oldest, None)
+                buf = _StreamBuffer(first_ts=ts, last_ts=ts)
+                buf.seq_next = seq
+                self._streams[key] = buf
+                self._order.append(key)
+            else:
+                if key in self._order:
+                    self._order.remove(key)
+                self._order.append(key)
+
+            buf = self._streams[key]
+            buf.last_ts = ts
+
+            if len(buf.data) + len(payload) > self._MAX_STREAM_SZ:
+                # Ring-trim: drop oldest half
+                half = len(buf.data) // 2
+                del buf.data[:half]
+
+            # Simple in-order: accept seq == expected or beyond (gaps logged)
+            if seq == buf.seq_next or buf.seq_next == 0:
+                buf.data.extend(payload)
+                buf.seq_next = seq + len(payload)
+                buf.segments += 1
+            elif seq > buf.seq_next:
+                # Gap: pad with zero-bytes placeholder
+                gap = min(seq - buf.seq_next, 65535)
+                buf.data.extend(b'\x00' * gap)
+                buf.data.extend(payload)
+                buf.seq_next = seq + len(payload)
+                buf.gaps += 1
+                buf.segments += 1
+            # seq < seq_next → retransmit, ignore
+
+    def get_stream(self, src_ip: str, sport: int,
+                   dst_ip: str, dport: int) -> Optional[bytes]:
+        key = self._key(src_ip, sport, dst_ip, dport)
+        with self._lock:
+            buf = self._streams.get(key)
+            return bytes(buf.data) if buf else None
+
+    def get_bidirectional(self, ip_a: str, port_a: int,
+                          ip_b: str, port_b: int) -> bytes:
+        """Merge A→B and B→A streams, returning all payload bytes."""
+        with self._lock:
+            fwd = self._streams.get(self._key(ip_a, port_a, ip_b, port_b))
+            rev = self._streams.get(self._key(ip_b, port_b, ip_a, port_a))
+            parts: List[bytes] = []
+            if fwd:
+                parts.append(bytes(fwd.data))
+            if rev:
+                parts.append(bytes(rev.data))
+            return b''.join(parts)
+            
+    def stream_stats(self, src_ip: str, sport: int,
+                     dst_ip: str, dport: int) -> Dict[str, Any]:
+        key = self._key(src_ip, sport, dst_ip, dport)
+        with self._lock:
+            buf = self._streams.get(key)
+            if not buf:
+                return {}
+            return {
+                'bytes':    len(buf.data),
+                'segments': buf.segments,
+                'gaps':     buf.gaps,
+                'first_ts': buf.first_ts,
+                'last_ts':  buf.last_ts,
+                'duration': buf.last_ts - buf.first_ts,
+            }
+            
+    def clear_stream(self, src_ip: str, sport: int,
+                     dst_ip: str, dport: int) -> None:
+        key = self._key(src_ip, sport, dst_ip, dport)
+        with self._lock:
+            self._streams.pop(key, None)
+            if key in self._order:
+                self._order.remove(key)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._streams.clear()
+            self._order.clear()
+
+    def active_stream_count(self) -> int:
+        with self._lock:
+            return len(self._streams)
+
+    def top_streams_by_size(self, n: int = 10) -> List[Dict[str, Any]]:
+        with self._lock:
+            ranked = sorted(
+                self._streams.items(),
+                key=lambda kv: len(kv[1].data),
+                reverse=True
+            )[:n]
+            return [
+                {
+                    'src': f"{k[0]}:{k[1]}",
+                    'dst': f"{k[2]}:{k[3]}",
+                    'bytes': len(v.data),
+                    'segments': v.segments,
+                    'gaps': v.gaps,
+                }
+                for k, v in ranked
+            ]
+            
+            
+class ProtocolStats:
+    """Counts packets and bytes per protocol, tracks top talkers, port usage."""
+    
+    def __init__(self) -> None:
+        self._lock         = threading.RLock()
+        self._proto_pkts:  Dict[str, int]        = {}
+        self._proto_bytes: Dict[str, int]        = {}
+        self._src_bytes:   Dict[str, int]        = {}
+        self._dst_bytes:   Dict[str, int]        = {}
+        self._port_counts: Dict[int, int]        = {}
+        self._total_pkts:  int                   = 0
+        self._total_bytes: int                   = 0
+        self._window_pkts: deque                 = deque(maxlen=3600)  # 1 h @ 1pps
+        
+    def record(self, summary: Dict[str, Any]) -> None:
+        proto  = summary.get('proto', 'OTHER')
+        length = summary.get('len', 0)
+        src    = summary.get('src', '')
+        dst    = summary.get('dst', '')
+
+        # Strip port suffix from addresses for top-talker tracking
+        src_host = src.split(':')[0] if ':' in src else src
+        dst_host = dst.split(':')[0] if ':' in dst else dst
+        
+        with self._lock:
+            self._proto_pkts[proto] = self._proto_pkts.get(proto, 0)  + 1
+            self._proto_bytes[proto] = self._proto_bytes.get(proto, 0) + length
+            if src_host:
+                self._src_bytes[src_host] = self._src_bytes.get(src_host, 0) + length
+            if dst_host:
+                self._dst_bytes[dst_host] = self._dst_bytes.get(dst_host, 0) + length
+                
+            # Port tracking (TCP/UDP)
+            layers = summary.get('layers', [])
+            for layer in layers:
+                lname = layer.get('name', '')
+                if lname in ('TCP', 'UDP'):
+                    for field_name in ('dport', 'dst_port'):
+                        port = layer.get(field_name)
+                        if isinstance(port, int):
+                            self._port_counts[port] = \
+                                self._port_counts.get(port, 0) + 1
+            self._total_pkts += 1
+            self._total_bytes += length
+            self._window_pkts.append(time.monotonic())
+            
+    def proto_distribution(self) -> List[Tuple[str, int, int, float]]:
+        """Returns list of (proto, pkts, bytes, pct_of_total_bytes)."""
+        with self._lock:
+            total = self._total_bytes or 1
+            return sorted(
+                [
+                    (p, self._proto_pkts[p], self._proto_bytes[p],
+                     100.0 * self._proto_bytes[p] / total)
+                    for p in self._proto_pkts
+                ],
+                key=lambda x: x[2], reverse=True
+            )
+
+    def top_talkers_src(self, n: int = 10) -> List[Tuple[str, int]]:
+        with self._lock:
+            return sorted(self._src_bytes.items(),
+                          key=lambda x: x[1], reverse=True)[:n]
+
+    def top_talkers_dst(self, n: int = 10) -> List[Tuple[str, int]]:
+        with self._lock:
+            return sorted(self._dst_bytes.items(),
+                          key=lambda x: x[1], reverse=True)[:n]
+
+    def top_ports(self, n: int = 15) -> List[Tuple[int, int]]:
+        with self._lock:
+            return sorted(self._port_counts.items(),
+                          key=lambda x: x[1], reverse=True)[:n]
+
+    def pps_last_n_seconds(self, seconds: int = 60) -> float:
+        now = time.monotonic()
+        cutoff = now - seconds
+        with self._lock:
+            count = sum(1 for t in self._window_pkts if t >= cutoff)
+        return count / max(seconds, 1)
+
+    def totals(self) -> Tuple[int, int]:
+        with self._lock:
+            return self._total_pkts, self._total_bytes
+
+    def clear(self) -> None:
+        with self._lock:
+            self._proto_pkts.clear()
+            self._proto_bytes.clear()
+            self._src_bytes.clear()
+            self._dst_bytes.clear()
+            self._port_counts.clear()
+            self._total_pkts  = 0
+            self._total_bytes = 0
+            self._window_pkts.clear()
+            
+            
+class BaselineDetector:
+    """Builds a rolling EMA baseline of pps/bps and fires alerts on deviation.
+    Uses a two-phase approach: learn phase (silent) -> monitor phase (alerts)."""
+    
+    _LEARN_SECONDS = 120    # 2-minute warm-up before alerting
+    _ALERT_MULT    = 4.0    # alert if current > baseline * multiplier
+    _ALERT_COOLDOWN = 30.0  # minimum seconds between same-type alerts
+
+    def __init__(self, alert_cb: Callable[[str], None]) -> None:
+        self._alert_cb    = alert_cb
+        self._alpha       = 0.05          # EMA smoothing factor
+        self._ema_pps     = 0.0
+        self._ema_bps     = 0.0
+        self._ema_var_pps = 0.0           # variance EMA for adaptive threshold
+        self._ema_var_bps = 0.0
+        self._start_ts    = time.monotonic()
+        self._last_pps_alert = 0.0
+        self._last_bps_alert = 0.0
+        self._lock        = threading.Lock()
+
+    def _in_learn_phase(self) -> bool:
+        return (time.monotonic() - self._start_ts) < self._LEARN_SECONDS
+
+    def update(self, pps: float, bps: float) -> None:
+        with self._lock:
+            if self._ema_pps == 0.0:
+                self._ema_pps = pps
+                self._ema_bps = bps
+                return
+
+            # Update EMA
+            prev_pps, prev_bps = self._ema_pps, self._ema_bps
+            self._ema_pps = self._alpha * pps + (1 - self._alpha) * self._ema_pps
+            self._ema_bps = self._alpha * bps + (1 - self._alpha) * self._ema_bps
+
+            # Update variance EMA (Welford-lite)
+            self._ema_var_pps = self._alpha * (pps - prev_pps) ** 2 + \
+                                (1 - self._alpha) * self._ema_var_pps
+            self._ema_var_bps = self._alpha * (bps - prev_bps) ** 2 + \
+                                (1 - self._alpha) * self._ema_var_bps
+
+            if self._in_learn_phase():
+                return
+
+            now = time.monotonic()
+            # Adaptive threshold: use 3-sigma if variance is meaningful
+            pps_sigma = max(self._ema_var_pps ** 0.5, self._ema_pps * 0.1)
+            bps_sigma = max(self._ema_var_bps ** 0.5, self._ema_bps * 0.1)
+            pps_thresh = max(self._ema_pps * self._ALERT_MULT,
+                             self._ema_pps + 3 * pps_sigma)
+            bps_thresh = max(self._ema_bps * self._ALERT_MULT,
+                             self._ema_bps + 3 * bps_sigma)
+
+            if pps > pps_thresh and (now - self._last_pps_alert) > self._ALERT_COOLDOWN:
+                self._last_pps_alert = now
+                self._alert_cb(
+                    f"[ANOMALY] Packet rate spike: {pps:.0f} pps "
+                    f"(baseline {self._ema_pps:.0f}, threshold {pps_thresh:.0f})"
+                )
+
+            if bps > bps_thresh and (now - self._last_bps_alert) > self._ALERT_COOLDOWN:
+                self._last_bps_alert = now
+                self._alert_cb(
+                    f"[ANOMALY] Bandwidth spike: "
+                    f"{TrafficTelemetry.format_unit(bps, True)}/s "
+                    f"(baseline {TrafficTelemetry.format_unit(self._ema_bps, True)}/s)"
+                )
+
+    def baseline_summary(self) -> Dict[str, float]:
+        with self._lock:
+            return {
+                'ema_pps':     self._ema_pps,
+                'ema_bps':     self._ema_bps,
+                'var_pps':     self._ema_var_pps,
+                'var_bps':     self._ema_var_bps,
+                'learning':    self._in_learn_phase(),
+                'uptime':      time.monotonic() - self._start_ts,
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._ema_pps     = 0.0
+            self._ema_bps     = 0.0
+            self._ema_var_pps = 0.0
+            self._ema_var_bps = 0.0
+            self._start_ts    = time.monotonic()
 
 
 # -----------------------------------------------------------------
@@ -514,6 +944,205 @@ class FastDissector:
             except Exception:
                 continue
         return findings
+        
+    @staticmethod
+    def _decode_dhcp(data: bytes) -> Optional[Dict[str, Any]]:
+        """Minimal DHCP decoder (RFC 2131). Returns dict or None."""
+        if len(data) < 236:
+            return None
+        try:
+            op     = data[0]   # 1=request, 2=reply
+            htype  = data[1]
+            hlen   = data[2]
+            xid    = struct.unpack_from('>I', data, 4)[0]
+            ciaddr = socket.inet_ntoa(data[12:16])
+            yiaddr = socket.inet_ntoa(data[16:20])
+            siaddr = socket.inet_ntoa(data[20:24])
+            chaddr = ':'.join(f'{b:02x}' for b in data[28:28 + min(hlen, 6)])
+
+            info: Dict[str, Any] = {
+                'op':     'REQUEST' if op == 1 else 'REPLY',
+                'xid':    f'0x{xid:08x}',
+                'ciaddr': ciaddr,
+                'yiaddr': yiaddr,
+                'siaddr': siaddr,
+                'chaddr': chaddr,
+                'options': {},
+            }
+
+            # Parse options (magic cookie at offset 236)
+            if data[236:240] != b'\x63\x82\x53\x63':
+                return info
+                
+            i = 240
+            while i < len(data):
+                opt = data[i]
+                i += 1
+                if opt == 255:  # END
+                    break
+                if opt == 0:
+                    continue
+                if i >= len(data):
+                    break
+                length = data[i]
+                i += 1
+                val = data[i:i + length]
+                i += length
+                
+                if opt == 53 and length == 1:    # DHCP message type
+                    _types = {1:'DISCOVER',2:'OFFER',3:'REQUEST',4:'DECLINE',
+                               5:'ACK',6:'NAK',7:'RELEASE',8:'INFORM'}
+                    info['msg_type'] = _types.get(val[0], str(val[0]))
+                elif opt == 50 and length == 4:  # Requested IP
+                    info['options']['requested_ip'] = socket.inet_ntoa(val)
+                elif opt == 51 and length == 4:  # Lease time
+                    info['options']['lease_time'] = struct.unpack('>I', val)[0]
+                elif opt == 54 and length == 4:  # Server identifier
+                    info['options']['server_id'] = socket.inet_ntoa(val)
+                elif opt == 12:                  # Hostname
+                    info['options']['hostname'] = FastDissector._safe_str(val, 64)
+                elif opt == 60:                  # Vendor class
+                    info['options']['vendor'] = FastDissector._safe_str(val, 64)
+            return info
+        except Exception:
+            return None
+            
+    # --- SNMP decoder (v1/v2c community string leak detector) ---
+    @staticmethod
+    def _decode_snmp_community(data: bytes) -> Optional[str]:
+        """Extract SNMP community string from v1/v2c PDU for credential scanning."""
+        try:
+            if data[0] != 0x30:   # SEQUENCE
+                return None
+            # Skip outer SEQUENCE length
+            idx = 2 if data[1] < 0x80 else 2 + (data[1] & 0x7f)
+            # Version INTEGER
+            if data[idx] != 0x02:
+                return None
+            vlen = data[idx + 1]
+            idx += 2 + vlen
+            # Community STRING
+            if data[idx] != 0x04:
+                return None
+            clen = data[idx + 1]
+            community = data[idx + 2: idx + 2 + clen].decode('latin-1', errors='replace')
+            return community
+        except Exception:
+            return None
+
+    # --- mDNS / DNS-SD question/answer name extractor ---
+    @staticmethod
+    def _decode_mdns_names(data: bytes) -> List[str]:
+        """Return list of service names from mDNS packet (best-effort)."""
+        names: List[str] = []
+        try:
+            import dpkt.dns as dns_mod
+            pkt = dns_mod.DNS(data)
+            for q in pkt.qd:
+                names.append(q.name)
+            for a in pkt.an:
+                names.append(a.name)
+        except Exception:
+            pass
+        return names
+
+    # --- QUIC version sniffer (Initial packet detection) ---
+    @staticmethod
+    def _detect_quic(data: bytes) -> Optional[str]:
+        """Return QUIC version string if first byte looks like a QUIC long header."""
+        if len(data) < 5:
+            return None
+        first = data[0]
+        # Long header: bit 7 set, bit 6 set (fixed bit)
+        if (first & 0xC0) == 0xC0:
+            version = struct.unpack_from('>I', data, 1)[0]
+            known = {
+                0x00000001: 'QUICv1 (RFC 9000)',
+                0xff00001d: 'QUIC draft-29',
+                0xff00001e: 'QUIC draft-30',
+                0xff00001f: 'QUIC draft-31',
+                0xff000020: 'QUIC draft-32',
+                0x6b3343cf: 'QUIC v2 (RFC 9369)',
+            }
+            return known.get(version, f'QUIC 0x{version:08x}')
+        return None
+
+    # --- SSH banner extractor ---
+    @staticmethod
+    def _extract_ssh_banner(payload: bytes) -> Optional[str]:
+        """Return SSH version banner if payload starts with SSH-."""
+        try:
+            if payload[:4] == b'SSH-':
+                end = payload.find(b'\r\n')
+                if end == -1:
+                    end = payload.find(b'\n')
+                banner = payload[:end if end > 0 else 128].decode('ascii', errors='replace')
+                return banner.strip()
+        except Exception:
+            pass
+        return None
+
+    # --- FTP command/response parser ---
+    @staticmethod
+    def _parse_ftp(payload: bytes) -> Optional[Dict[str, str]]:
+        try:
+            line = payload[:256].decode('ascii', errors='replace').strip()
+            # Response: 3-digit code
+            if line[:3].isdigit() and len(line) > 3 and line[3] in (' ', '-'):
+                return {'type': 'response', 'code': line[:3], 'msg': line[4:]}
+            # Command
+            parts = line.split(None, 1)
+            if parts:
+                cmd = parts[0].upper()
+                arg = parts[1] if len(parts) > 1 else ''
+                # Mask password
+                if cmd == 'PASS':
+                    arg = '***REDACTED***'
+                return {'type': 'command', 'cmd': cmd, 'arg': arg}
+        except Exception:
+            pass
+        return None
+
+    # --- SMTP command sniffer ---
+    @staticmethod
+    def _parse_smtp(payload: bytes) -> Optional[Dict[str, str]]:
+        try:
+            line = payload[:512].decode('ascii', errors='replace').strip()
+            if line[:3].isdigit():
+                return {'type': 'response', 'code': line[:3], 'msg': line[4:]}
+            parts = line.split(None, 1)
+            if parts:
+                cmd = parts[0].upper()
+                arg = parts[1] if len(parts) > 1 else ''
+                # AUTH LOGIN / PLAIN — base64 credentials
+                if cmd == 'AUTH':
+                    return {'type': 'command', 'cmd': cmd, 'arg': arg}
+                if cmd in ('EHLO', 'HELO', 'MAIL', 'RCPT', 'DATA',
+                            'QUIT', 'STARTTLS', 'RSET'):
+                    return {'type': 'command', 'cmd': cmd, 'arg': arg}
+        except Exception:
+            pass
+        return None
+
+    # --- Telnet IAC option scanner ---
+    @staticmethod
+    def _detect_telnet(payload: bytes) -> bool:
+        """True if payload looks like Telnet (contains IAC byte 0xff)."""
+        return b'\xff' in payload[:64]
+
+    # --- NTLM challenge detector ---
+    @staticmethod
+    def _detect_ntlm(payload: bytes) -> Optional[str]:
+        """Detect NTLM auth blobs and return type string."""
+        try:
+            if b'NTLMSSP\x00' in payload:
+                idx = payload.index(b'NTLMSSP\x00')
+                msg_type = struct.unpack_from('<I', payload, idx + 8)[0]
+                return {1: 'NTLM Negotiate', 2: 'NTLM Challenge',
+                        3: 'NTLM Authenticate'}.get(msg_type, 'NTLM Unknown')
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _tcp_flag_string(flags: int) -> str:
@@ -1255,6 +1884,89 @@ class FlowTracker:
 
     def top_flows(self, n: int = 10) -> List[Dict[str, Any]]:
         return sorted(self.flows.values(), key=lambda f: f['bytes'], reverse=True)[:n]
+        
+    def update_tcp_metrics(self, summary: Dict[str, Any], ts: float) -> None:
+        """Track TCP retransmits and window sizes per flow."""
+        if summary.get('proto') not in ('TCP', 'TLS', 'HTTP'):
+            return
+
+        src = summary.get('src', '')
+        dst = summary.get('dst', '')
+        if not src or not dst:
+            return
+
+        endpoints = frozenset([src, dst])
+        proto     = summary.get('proto', 'TCP')
+        fkey      = (endpoints, proto)
+
+        if not hasattr(self, '_tcp_metrics'):
+            self._tcp_metrics: Dict[Any, Dict] = {}
+
+        with self._lock:
+            m = self._tcp_metrics.setdefault(fkey, {
+                'retransmits': 0,
+                'window_sizes': [],
+                'seq_seen':     set(),
+                'rtt_samples':  [],
+            })
+
+            for layer in summary.get('layers', []):
+                if layer.get('name') != 'TCP':
+                    continue
+                seq  = layer.get('seq', 0)
+                ack  = layer.get('ack', 0)
+                win  = layer.get('window', 0)
+                flags = layer.get('flags_str', '')
+
+                if win:
+                    m['window_sizes'].append(win)
+                    if len(m['window_sizes']) > 100:
+                        del m['window_sizes'][:50]
+
+                if seq and seq in m['seq_seen']:
+                    m['retransmits'] += 1
+                elif seq:
+                    m['seq_seen'].add(seq)
+                    if len(m['seq_seen']) > 500:
+                        # Keep only recent 250
+                        m['seq_seen'] = set(list(m['seq_seen'])[-250:])
+                        
+    def tcp_flow_metrics(self, src: str, dst: str,
+                         proto: str = 'TCP') -> Dict[str, Any]:
+        """Return TCP metrics for a given flow."""
+        if not hasattr(self, '_tcp_metrics'):
+            return {}
+        endpoints = frozenset([src, dst])
+        fkey = (endpoints, proto)
+        with self._lock:
+            m = self._tcp_metrics.get(fkey, {})
+            if not m:
+                return {}
+            wins = m.get('window_sizes', [])
+            return {
+                'retransmits':  m.get('retransmits', 0),
+                'avg_win':      sum(wins) / len(wins) if wins else 0,
+                'min_win':      min(wins) if wins else 0,
+                'max_win':      max(wins) if wins else 0,
+                'unique_seqs':  len(m.get('seq_seen', set())),
+            }
+
+    def flows_with_retransmits(self, min_retransmits: int = 3) -> List[Dict]:
+        """Return flows that have seen at least min_retransmits retransmits."""
+        if not hasattr(self, '_tcp_metrics'):
+            return []
+        with self._lock:
+            results = []
+            for (endpoints, proto), m in self._tcp_metrics.items():
+                rt = m.get('retransmits', 0)
+                if rt >= min_retransmits:
+                    eps = list(endpoints)
+                    results.append({
+                        'endpoints':    eps,
+                        'proto':        proto,
+                        'retransmits':  rt,
+                    })
+            return sorted(results, key=lambda x: x['retransmits'], reverse=True)
 
     def clear(self) -> None:
         self.flows.clear()
@@ -1648,6 +2360,140 @@ class ThreatAuditor:
             if cert.get('is_self_signed') and key not in self.selfsigned_cert_history:
                 self.selfsigned_cert_history.add(key)
                 self.alert_cb(f"SELF‑SIGNED CERT: {sni} ({subj})")
+                
+    def audit_dns_tunneling(self, summary: Dict[str, Any]) -> None:
+        """Heuristic DNS tunneling detector:
+        flags long subdomain labels and high-entropy names."""
+        if summary.get('proto') not in ('DNS',):
+            return
+        for layer in summary.get('layers', []):
+            if layer.get('name') != 'DNS':
+                continue
+            queries = layer.get('queries', [])
+            for q in queries:
+                name = q.get('name', '')
+                if not name:
+                    continue
+            labels = name.split('.')
+            # Flag 1: any single label > 50 chars
+            if long_labels:
+                self.alert_cb(
+                        f"[DNS-TUNNEL] Long label in query '{name[:80]}' "
+                        f"from {summary.get('src', '?')} "
+                        f"({len(long_labels)} oversized label(s))"
+                    )
+                    return
+                # Flag 2: total FQDN > 100 chars with ≥ 4 labels
+                if len(name) > 100 and len(labels) >= 4:
+                    # Entropy check on first label
+                    first = labels[0]
+                    if len(first) > 20:
+                        entropy = self._shannon_entropy(first)
+                        if entropy > 3.8:
+                            self.alert_cb(
+                                f"[DNS-TUNNEL] High-entropy DNS label "
+                                f"'{first[:40]}' (H={entropy:.2f}) "
+                                f"from {summary.get('src', '?')}"
+                            )
+                            return
+                            
+    @staticmethod
+    def _shannon_entropy(s: str) -> float:
+        if not s:
+            return 0.0
+        from math import log2
+        freq: Dict[str, int] = {}
+        for c in s:
+            freq[c] = freq.get(c, 0) + 1
+        n = len(s)
+        return -sum((c / n) * log2(c / n) for c in freq.values())
+        
+    def audit_cleartext_credentials(self, summary: Dict[str, Any]) -> None:
+        """Alert on credential leaks detected by FastDissector."""
+        creds = summary.get('creds', [])
+        for cred in creds:
+            src = summary.get('src', '?')
+            dst = summary.get('dst', '?')
+            self.alert_cb(
+                f"[CRED-LEAK] {cred.get('type', 'cred')} detected "
+                f"{src} → {dst} | value preview: "
+                f"{str(cred.get('value', ''))[:40]}"
+            )
+            
+    def audit_llmnr_nbns(self, summary: Dict[str, Any]) -> None:
+        """Detect LLMNR (5355/UDP) and NetBIOS-NS (137/UDP) traffic.
+        These protocols are abused for poisoning (Responder)."""
+        layers = summary.get('layers', [])
+        for layer in layers:
+            if layer.get('name') != 'UDP':
+                continue
+            dport = layer.get('dport', 0) or layer.get('dst_port', 0)
+            if dport == 5355:
+                self.alert_cb(
+                    f"[LLMNR] LLMNR query from {summary.get('src', '?')} — "
+                    f"susceptible to poisoning (Responder/Inveigh)"
+                )
+            elif dport == 137:
+                self.alert_cb(
+                    f"[NBNS] NetBIOS Name Service from {summary.get('src', '?')} — "
+                    f"susceptible to NBNS spoofing"
+                )
+
+    def audit_brute_force(self, summary: Dict[str, Any],
+                          ts: float) -> None:
+        """Track authentication failure patterns on common service ports.
+        Ports: SSH(22), FTP(21), RDP(3389), SMB(445), Telnet(23), IMAP(143),
+               POP3(110), SMTP(25/587), HTTP-Auth(80/443/8080/8443)."""
+        _AUTH_PORTS = {21, 22, 23, 25, 110, 143, 445, 587, 3389,
+                       80, 443, 8080, 8443}
+        _THRESHOLD  = 10   # failed attempts per window
+        _WINDOW     = 30.0  # seconds
+
+        layers = summary.get('layers', [])
+        for layer in layers:
+            if layer.get('name') not in ('TCP', 'UDP'):
+                continue
+            dport = layer.get('dport', 0) or layer.get('dst_port', 0)
+            if dport not in _AUTH_PORTS:
+                continue
+            src = summary.get('src', '?').split(':')[0]
+            key = (src, dport)
+
+            if not hasattr(self, '_brute_tracking'):
+                self._brute_tracking: Dict[Any, deque] = {}
+            if not hasattr(self, '_brute_alerted'):
+                self._brute_alerted: Set[Any] = set()
+
+            window = self._brute_tracking.setdefault(key, deque())
+            window.append(ts)
+            # Prune outside window
+            while window and ts - window[0] > _WINDOW:
+                window.popleft()
+
+            if len(window) >= _THRESHOLD and key not in self._brute_alerted:
+                self._brute_alerted.add(key)
+                self.alert_cb(
+                    f"[BRUTE-FORCE] {src} → port {dport}: "
+                    f"{len(window)} packets in {_WINDOW:.0f}s window"
+                )
+                # Reset after alerting so it can re-trigger
+                window.clear()
+                self._brute_alerted.discard(key)
+                
+    def audit_bandwidth_threshold(self, bps: float,
+                                  threshold_mbps: float = 100.0) -> None:
+        """Alert if bandwidth exceeds a configured threshold (default 100 Mbps)."""
+        threshold_bps = threshold_mbps * 1_000_000 / 8
+        if bps > threshold_bps:
+            self._bw_last_alert = 0.0
+        now = time.monotonic()
+        if now - self._bw_last_alert > 10.0:
+            self._bw_last_alert = now
+                mbps_actual = bps * 8 / 1_000_000
+                self.alert_cb(
+                    f"[BW-THRESH] Bandwidth {mbps_actual:.1f} Mbps "
+                    f"exceeds threshold {threshold_mbps:.0f} Mbps"
+                )
 
     def active_probe(self, target_ip: str, interface: str) -> None:
         """Send ARP probe (unchanged)."""
@@ -2430,21 +3276,46 @@ class VimSharkApp:
         self.root.body = overlay
 
     def show_export_modal(self) -> None:
-        edit = urwid.Edit("Filename: ", "filtered_capture.pcap")
-        btn = urwid.Button("Export PCAP")
-        cancel = urwid.Button("Cancel")
+        edit     = urwid.Edit("Filename: ", "capture")
+        fmt_pcap = urwid.RadioButton([], "PCAP")
+        fmt_json = urwid.RadioButton(fmt_pcap.group, "JSON")
+        fmt_csv  = urwid.RadioButton(fmt_pcap.group, "CSV")
+        fmt_txt  = urwid.RadioButton(fmt_pcap.group, "Summary TXT")
+        btn      = urwid.Button("Export")
+        cancel   = urwid.Button("Cancel")
 
         def do_export(_b):
-            filename = edit.get_edit_text()
-            self.export_filtered_packets(filename)
+            base = edit.get_edit_text().strip() or "capture"
+            if fmt_pcap.get_state():
+                fn = base if base.endswith('.pcap') else base + '.pcap'
+                self.export_filtered_packets(fn)
+            elif fmt_json.get_state():
+                fn = base if base.endswith('.json') else base + '.json'
+                self.export_json(fn)
+            elif fmt_csv.get_state():
+                fn = base if base.endswith('.csv') else base + '.csv'
+                self.export_csv(fn)
+            else:
+                fn = base if base.endswith('.txt') else base + '.txt'
+                self.export_summary_txt(fn)
             self._close_overlay()
 
         urwid.connect_signal(btn, 'click', do_export)
         urwid.connect_signal(cancel, 'click', self._close_overlay)
 
+        pile = urwid.Pile([
+            urwid.Text("--- Export Filtered Traffic ---"),
+            urwid.Divider(),
+            edit,
+            urwid.Divider(),
+            urwid.Text("Format:"),
+            fmt_pcap, fmt_json, fmt_csv, fmt_txt,
+            urwid.Divider(),
+            urwid.Columns([btn, cancel]),
+        ])
         overlay = urwid.Overlay(
-            urwid.LineBox(urwid.Filler(urwid.Pile([edit, urwid.Divider(), btn, cancel])), title="Export Filtered Traffic"),
-            self.root.body, 'center', 45, 'middle', 9
+            urwid.LineBox(urwid.Filler(pile, valign='top'), title="Export"),
+            self.root.body, 'center', 50, 'middle', 18
         )
         self.root.body = overlay
 
@@ -2474,6 +3345,8 @@ class VimSharkApp:
             urwid.LineBox(urwid.ListBox(urwid.SimpleListWalker(rows)), title="Flow Table"),
             parent, 'center', ('relative', 80), 'middle', ('relative', 80)
         )
+        
+    def show
 
     def export_filtered_packets(self, filename: str) -> None:
         try:
@@ -2490,6 +3363,136 @@ class VimSharkApp:
             self.queue_alert(f"Successfully exported {count} packets to {filename}")
         except Exception as e:
             self.queue_alert(f"Export failed: {e}")
+            
+    def export_json(self, filename: str) -> None:
+        """Export all visible (filtered) packets as a JSON array."""
+        try:
+            records = []
+            for idx in self.store.all_indices():
+                item = self.store.get(idx)
+                if not item:
+                    continue
+                raw, summary, ts = item
+                if not self.filter_fn(summary):
+                    continue
+                # Build a JSON-safe record
+                record: Dict[str, Any] = {
+                    'index':     idx,
+                    'timestamp': ts,
+                    'ts_iso':    datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    'proto':     summary.get('proto', ''),
+                    'src':       summary.get('src', ''),
+                    'dst':       summary.get('dst', ''),
+                    'length':    summary.get('len', 0),
+                    'summary':   summary.get('summary', ''),
+                    'creds':     summary.get('creds', []),
+                }
+                tls = summary.get('tls_info')
+                if tls:
+                    record['tls'] = {
+                        'sni':  tls.get('sni', ''),
+                        'ja3':  tls.get('ja3_md5', ''),
+                        'ja3s': tls.get('ja3s_md5', ''),
+                        'version': tls.get('version', ''),
+                    }
+                records.append(record)
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(records, f, indent=2, default=str)
+            self.queue_alert(f"JSON export: {len(records)} packets → {filename}")
+        except Exception as e:
+            self.queue_alert(f"JSON export failed: {e}")
+
+    def export_csv(self, filename: str) -> None:
+        """Export filtered packets as CSV (timestamp, proto, src, dst, len, summary)."""
+        try:
+            count = 0
+            fieldnames = ['index', 'timestamp', 'ts_iso', 'proto',
+                          'src', 'dst', 'length', 'summary',
+                          'tls_sni', 'ja3', 'has_creds']
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames,
+                                        extrasaction='ignore')
+                writer.writeheader()
+                for idx in self.store.all_indices():
+                    item = self.store.get(idx)
+                    if not item:
+                        continue
+                    raw, summary, ts = item
+                    if not self.filter_fn(summary):
+                        continue
+                    tls = summary.get('tls_info') or {}
+                    row = {
+                        'index':     idx,
+                        'timestamp': f'{ts:.6f}',
+                        'ts_iso':    datetime.fromtimestamp(
+                                         ts, tz=timezone.utc).isoformat(),
+                        'proto':     summary.get('proto', ''),
+                        'src':       summary.get('src', ''),
+                        'dst':       summary.get('dst', ''),
+                        'length':    summary.get('len', 0),
+                        'summary':   summary.get('summary', ''),
+                        'tls_sni':   tls.get('sni', ''),
+                        'ja3':       tls.get('ja3_md5', ''),
+                        'has_creds': '1' if summary.get('creds') else '0',
+                    }
+                    writer.writerow(row)
+                    count += 1
+            self.queue_alert(f"CSV export: {count} packets → {filename}")
+        except Exception as e:
+            self.queue_alert(f"CSV export failed: {e}")
+
+    def export_summary_txt(self, filename: str) -> None:
+        """Human-readable session summary: protocol stats, top talkers, alerts."""
+        try:
+            lines = [
+                f"vimShark Session Summary — {datetime.now().isoformat()}",
+                f"Interface/Source: {self.read_pcap or self.interface}",
+                f"Total packets in store: {len(self.store)}",
+                "",
+                "=== Protocol Distribution ===",
+            ]
+            dist = self.proto_stats.proto_distribution()
+            for proto, pkts, byt, pct in dist[:20]:
+                lines.append(
+                    f"  {proto:<10} {pkts:>8} pkts  "
+                    f"{TrafficTelemetry.format_unit(byt, True):>10}  "
+                    f"{pct:5.1f}%"
+                )
+            lines += ["", "=== Top Talkers (by bytes sent) ==="]
+            for ip, byt in self.proto_stats.top_talkers_src(10):
+                lines.append(
+                    f"  {ip:<20} {TrafficTelemetry.format_unit(byt, True):>10}"
+                )
+            lines += ["", "=== Top Destination Ports ==="]
+            for port, cnt in self.proto_stats.top_ports(15):
+                lines.append(f"  :{port:<6}  {cnt:>8} packets")
+            lines += ["", "=== Recent Alerts ==="]
+            for widget in self.alrt_walker:
+                txt = getattr(widget, 'text', None)
+                if txt:
+                    if isinstance(txt, list):
+                        txt = ''.join(
+                            t if isinstance(t, str) else t[-1]
+                            for t in txt
+                        )
+                    lines.append(f"  {txt}")
+
+            baseline = self.baseline_detector.baseline_summary()
+            lines += [
+                "",
+                "=== Traffic Baseline ===",
+                f"  EMA pps: {baseline['ema_pps']:.1f}",
+                f"  EMA bps: {TrafficTelemetry.format_unit(baseline['ema_bps'], True)}/s",
+                f"  Learning: {baseline['learning']}",
+                f"  Uptime:   {baseline['uptime']:.0f}s",
+            ]
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            self.queue_alert(f"Summary exported → {filename}")
+        except Exception as e:
+            self.queue_alert(f"Summary export failed: {e}")
 
     def _get_highlighted_markup(self, text: str, query: str) -> Any:
         """Helper to highlight search matches. Returns plain text or list markup."""
